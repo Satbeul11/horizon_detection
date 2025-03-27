@@ -1,0 +1,32 @@
+Parsing network를 이용한 수평선 검출.
+
+PSPN
+Pyramid Scene Parsing Network
+semantic Segmentation algorithm . 의미 단위로 픽셀단위 나눈것.
+
+PSPNet은 FCN(pixel prediction framework)와 ResNet(deeply supervised loss)를 baseline으로 둔다.
+
+**FCN은 global scene을 활용하지 못해 complex scene parsing 에서 잘 동작하지 않음.
+가장 기본적인 Convolution/**Transpose Covolution을 사용함.
+
+**FCN(Fully convolution networks)
+계층적 특징을 생성하는 기존 합성곱 네트워크를 개선한 모델.
+단독으로 학습되어 의미론적 세분화 성능을 높임.
+현대 분류 네트워크(AlexNet, VGG net, GoogleNet)을 완전 합성곱 네트워크로 변환
+
+
+PSPN은 **Dilated Convolution을 사용.
+Dilated convolution은 real-time segmentation 분야에서 사용.
+더 넓은 시야 필요, conv나 큰 kernel을 사용할 여유가 없는 경우에 사용.
+
+**Dilated Convolution(확장 합성곱)
+커널 내부의 간격을 늘리는 방법. 간격은 dilation rate.
+입력 이미지 중간 중간 부분을 건너 띄어서 인식하는 방법.
+더 넓은 수용영역을 가짐(Receptive field)
+Global한 context
+
+
++ Seperable Covolution(분리 합성곱)
+컨볼루션 연산을 두 단계로 분리하여 수행하는 기술.
+모델 경량화, 연산 효율성 향상.
+
