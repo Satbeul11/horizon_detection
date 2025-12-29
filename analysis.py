@@ -1,11 +1,10 @@
-# export_roi_all_distances_to_excel.py
-# 같은 폴더에 roi_using.py 와 함께 두고 실행하세요.
+# export_roi_overlay_images.py
+# roi_using.py 와 같은 폴더에 두고 실행하세요.
 
 import os
 import glob
 import cv2
 import numpy as np
-import pandas as pd
 
 from roi_using import FastHorizonDetector
 
@@ -14,12 +13,17 @@ def imread_unicode(path: str):
     stream = np.fromfile(path, dtype=np.uint8)
     return cv2.imdecode(stream, cv2.IMREAD_COLOR)
 
+def imwrite_unicode(path: str, img) -> bool:
+    ext = os.path.splitext(path)[1]
+    success, buf = cv2.imencode(ext, img)
+    if not success:
+        return False
+    buf.tofile(path)
+    return True
+
 
 def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector):
-    """
-    roi_using.py의 ROI 분할/거리 계산 로직을 외부에서 동일하게 재현.
-    - N개 regions -> (N-1)개 인접쌍 거리값 D 모두 반환
-    """
+    """ROI 9개(또는 실제 생성된 개수) + 인접쌍 거리(D) 전부 계산"""
     h, w = img_bgr.shape[:2]
     scale = detector.roi_resize_factor
 
@@ -64,9 +68,6 @@ def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector
         covs.append(cov)
 
     pair_distances = []  # (i, i+1, D)
-    best_dist = -1.0
-    best_pair = (0, 1)
-
     for i in range(len(regions) - 1):
         m1, m2 = means[i], means[i + 1]
         S1, S2 = covs[i], covs[i + 1]
@@ -80,132 +81,104 @@ def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector
         D = float(diff.T @ S_inv @ diff)
         pair_distances.append((i, i + 1, D))
 
-        if D > best_dist:
-            best_dist = D
-            best_pair = (i, i + 1)
-
-    # best_pair에 해당하는 최종 ROI (원본좌표)
-    y0_small = regions[best_pair[0]][0]
-    y1_small = regions[best_pair[1]][1]
-    roi_y0_orig = int(y0_small / scale)
-    roi_y1_orig = int(y1_small / scale)
-    roi_y0_orig = max(0, min(roi_y0_orig, h - 1))
-    roi_y1_orig = max(0, min(roi_y1_orig, h))
-
-    # 모든 후보 region도 원본좌표로
+    # regions를 원본 좌표로 변환
+    h0, w0 = h, w
     regions_orig = []
     for (ys0, ys1) in regions:
         yo0 = int(ys0 / scale)
         yo1 = int(ys1 / scale)
-        yo0 = max(0, min(yo0, h - 1))
-        yo1 = max(0, min(yo1, h))
+        yo0 = max(0, min(yo0, h0 - 1))
+        yo1 = max(0, min(yo1, h0))
         regions_orig.append((yo0, yo1))
 
     return {
-        "regions_orig": regions_orig,
-        "pair_distances": pair_distances,  # ✅ 여기 안에 8개가 들어감(9분할이면)
-        "best_pair": best_pair,
-        "best_dist": best_dist,
-        "roi_y0_orig": roi_y0_orig,
-        "roi_y1_orig": roi_y1_orig,
-        "meta": {"scale": scale, "small_h": small_h, "small_w": small_w},
+        "regions_orig": regions_orig,      # [(y0,y1), ...]  (보통 9개)
+        "pair_distances": pair_distances,  # [(0,1,D0), (1,2,D1), ...] (보통 8개)
     }
+
+
+def draw_roi_boxes_and_distances(img_bgr, regions_orig, pair_distances):
+    """
+    - 9개 ROI 구역: 사각형(가로 전체, 세로 y0~y1)
+    - 인접 경계 위치에 D 값을 텍스트로 표시
+    """
+    vis = img_bgr.copy()
+    h, w = vis.shape[:2]
+
+    # 폰트/두께
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.5, min(1.0, w / 2000.0))   # 화면 크기 따라 적당히
+    thickness = 2
+
+    # 1) ROI 박스(구역) 그리기
+    for k, (y0, y1) in enumerate(regions_orig):
+        # ROI 영역 박스
+        cv2.rectangle(vis, (0, y0), (w - 1, y1), (0, 255, 0), 2)
+        # ROI 인덱스 라벨 (왼쪽 위)
+        label = f"ROI {k}"
+        cv2.putText(vis, label, (10, max(20, y0 + 25)), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
+
+    # 2) 거리값을 “경계선”에 표시
+    # 경계선 y = regions_orig[i][1] (i의 끝 = i+1의 시작 근처)
+    # 텍스트는 오른쪽 여백에 표시
+    x_text = int(w * 0.70)  # 오른쪽 쪽에
+    for (i, j, dist) in pair_distances:
+        # i 구역 끝 y를 경계로 사용 (가독성 위해 약간 위/아래 조정)
+        y_boundary = regions_orig[i][1]
+        y_text = int(np.clip(y_boundary - 5, 20, h - 10))
+
+        text = f"D({i}-{j})={dist:.4f}"
+        # 경계선(수평선)도 얇게 하나 표시
+        cv2.line(vis, (0, y_boundary), (w - 1, y_boundary), (255, 255, 0), 1)
+        # 텍스트
+        cv2.putText(vis, text, (x_text, y_text), font, font_scale, (255, 255, 0), thickness, cv2.LINE_AA)
+
+    return vis
 
 
 def main():
     input_dir = r"C:\Users\LEEJINSE\Desktop\Horizon_detection\Algorithm_based\val_data"
 
-    # ✅ 이미지 저장 안 할 거라, 기존 results 폴더와 충돌 없게 엑셀 폴더만 따로
-    output_dir = os.path.join(input_dir, "excel_results")
-    os.makedirs(output_dir, exist_ok=True)
+    # ✅ 기존 results 폴더 건드리지 않게, 시각화 저장 폴더를 분리
+    out_dir = os.path.join(input_dir, "roi_overlay_results")
+    os.makedirs(out_dir, exist_ok=True)
 
-    detector = FastHorizonDetector()
+    detector = FastHorizonDetector(num_regions=9)  # 9개 분할 원하면 명시적으로
 
-    # ✅ val_data "바로 아래" jpg만: results 하위폴더 jpg는 제외
-    # val_data 바로 아래 jpg/jpeg만 수집
+    # ✅ val_data 바로 아래 jpg/jpeg만 (results 하위폴더 제외)
     img_paths = []
     img_paths += glob.glob(os.path.join(input_dir, "*.jpg"))
     img_paths += glob.glob(os.path.join(input_dir, "*.jpeg"))
 
-    # ✅ Windows 대소문자/경로 차이로 인한 중복 제거
-    img_paths = sorted(
-        set(os.path.normcase(os.path.abspath(p)) for p in img_paths)
-    )
-
-    # (안전장치) 하위 폴더(results 등) 완전 제외
+    # 중복 제거 + 안전 필터
+    img_paths = sorted(set(os.path.normcase(os.path.abspath(p)) for p in img_paths))
     input_dir_norm = os.path.normcase(os.path.abspath(input_dir))
-    img_paths = [
-        p for p in img_paths
-        if os.path.normcase(os.path.dirname(p)) == input_dir_norm
-    ]
+    img_paths = [p for p in img_paths if os.path.normcase(os.path.dirname(p)) == input_dir_norm]
 
-    per_image_wide = []
-    pair_long = []
-    all_regions = []
-
+    total = len(img_paths)
     for idx, img_path in enumerate(img_paths, start=1):
         img_id = os.path.basename(img_path)
-        print(f"[{idx}/{len(img_paths)}] {img_id}")
+        print(f"[{idx}/{total}] {img_id}")
 
         img = imread_unicode(img_path)
         if img is None:
             print("  -> load fail, skip")
             continue
 
-        h, w = img.shape[:2]
         debug = compute_all_roi_distances(img, detector)
         if debug is None:
-            print("  -> ROI debug fail, skip")
+            print("  -> ROI calc fail, skip")
             continue
 
-        # ---------- (A) 이미지당 1행(WIDE): D_0_1 ~ D_7_8 칼럼으로 저장 ----------
-        row = {
-            "img_id": img_id,
-            "img_h": h,
-            "img_w": w,
-            "num_regions": len(debug["regions_orig"]),
-            "num_pairs": len(debug["pair_distances"]),
-            "best_pair_i": debug["best_pair"][0],
-            "best_pair_j": debug["best_pair"][1],
-            "best_dist": debug["best_dist"],
-            "roi_y0_orig": debug["roi_y0_orig"],
-            "roi_y1_orig": debug["roi_y1_orig"],
-        }
+        regions_orig = debug["regions_orig"]
+        pair_distances = debug["pair_distances"]
 
-        # ✅ 8개 거리값 전부 넣기 (인접쌍 개수만큼)
-        for (i, j, dist) in debug["pair_distances"]:
-            row[f"D_{i}_{j}"] = dist
+        vis = draw_roi_boxes_and_distances(img, regions_orig, pair_distances)
 
-        per_image_wide.append(row)
+        save_path = os.path.join(out_dir, os.path.splitext(img_id)[0] + "_roi_overlay.jpg")
+        imwrite_unicode(save_path, vis)
 
-        # ---------- (B) 롱포맷: 이미지-쌍거리 1개당 1행 ----------
-        for (i, j, dist) in debug["pair_distances"]:
-            pair_long.append({
-                "img_id": img_id,
-                "pair_i": i,
-                "pair_j": j,
-                "bhatt_like_dist": dist,
-                "is_best": 1 if debug["best_pair"] == (i, j) else 0,
-            })
-
-        # ---------- (C) 모든 ROI 구역 좌표 ----------
-        for k, (y0, y1) in enumerate(debug["regions_orig"]):
-            all_regions.append({
-                "img_id": img_id,
-                "roi_idx": k,
-                "y0_orig": y0,
-                "y1_orig": y1,
-                "height": max(0, y1 - y0),
-            })
-
-    # ---------- 엑셀 저장 ----------
-    xlsx_path = os.path.join(output_dir, "roi_all_pair_distances.xlsx")
-    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        pd.DataFrame(per_image_wide).to_excel(writer, index=False, sheet_name="per_image_wide")
-        pd.DataFrame(pair_long).to_excel(writer, index=False, sheet_name="pair_dist_long")
-        pd.DataFrame(all_regions).to_excel(writer, index=False, sheet_name="all_regions")
-
-    print("\n[DONE] Excel saved:", xlsx_path)
+    print("\n[DONE] Saved overlays to:", out_dir)
 
 
 if __name__ == "__main__":
