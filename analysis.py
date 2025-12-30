@@ -1,4 +1,4 @@
-# export_roi_overlay_with_horizon.py
+# export_roi_overlay_with_horizon_stats.py
 # roi_using.py 와 같은 폴더에 두고 실행하세요.
 
 import os
@@ -22,8 +22,14 @@ def imwrite_unicode(path: str, img) -> bool:
     return True
 
 
-def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector):
-    """ROI 분할(보통 9개) + 인접쌍 거리(보통 8개) 전부 계산"""
+def compute_roi_stats_and_distances(img_bgr: np.ndarray, detector: FastHorizonDetector):
+    """
+    Bhattacharyya 거리 계산에 사용되는 것과 동일한 방식으로:
+    - regions (보통 9개)
+    - 각 region의 mean(3), cov(3x3)
+    - 인접쌍 거리 D (보통 8개)
+    를 반환
+    """
     h, w = img_bgr.shape[:2]
     scale = detector.roi_resize_factor
 
@@ -41,7 +47,7 @@ def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector
     step = small_h // (N + 1)
     region_height = step * 2  # 50% overlap
 
-    regions = []
+    regions_small = []
     for i in range(N):
         y0 = i * step
         y1 = min(y0 + region_height, small_h)
@@ -49,26 +55,28 @@ def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector
             break
         if y1 - y0 < 5:
             continue
-        regions.append((y0, y1))
+        regions_small.append((y0, y1))
 
-    if len(regions) < 2:
+    if len(regions_small) < 2:
         return None
 
     means, covs = [], []
     eps = 1e-6
-    for (y0, y1) in regions:
+    for (y0, y1) in regions_small:
         region = img_small[y0:y1, :]
         pixels = region.reshape(-1, 3).astype(np.float32)
-        mean = np.mean(pixels, axis=0)
-        cov = np.cov(pixels, rowvar=False)
+        mean = np.mean(pixels, axis=0)                # (3,)
+        cov = np.cov(pixels, rowvar=False)            # (3,3)
         if cov.shape == ():
             cov = np.eye(3, dtype=np.float32)
         cov = cov + eps * np.eye(3, dtype=np.float32)
+
         means.append(mean)
         covs.append(cov)
 
-    pair_distances = []  # (i, i+1, D)
-    for i in range(len(regions) - 1):
+    # 인접쌍 거리 D
+    pair_distances = []
+    for i in range(len(regions_small) - 1):
         m1, m2 = means[i], means[i + 1]
         S1, S2 = covs[i], covs[i + 1]
         diff = (m1 - m2).reshape(3, 1)
@@ -81,9 +89,9 @@ def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector
         D = float(diff.T @ S_inv @ diff)
         pair_distances.append((i, i + 1, D))
 
-    # regions를 원본 좌표로 변환
+    # small -> original 좌표 변환(ROI 박스용)
     regions_orig = []
-    for (ys0, ys1) in regions:
+    for (ys0, ys1) in regions_small:
         yo0 = int(ys0 / scale)
         yo1 = int(ys1 / scale)
         yo0 = max(0, min(yo0, h - 1))
@@ -91,31 +99,85 @@ def compute_all_roi_distances(img_bgr: np.ndarray, detector: FastHorizonDetector
         regions_orig.append((yo0, yo1))
 
     return {
-        "regions_orig": regions_orig,      # [(y0,y1), ...]
-        "pair_distances": pair_distances,  # [(0,1,D), (1,2,D), ...]
+        "regions_orig": regions_orig,
+        "means": means,
+        "covs": covs,
+        "pair_distances": pair_distances,
     }
 
 
-def draw_roi_boxes_and_distances(vis, regions_orig, pair_distances):
-    """ROI 박스(구역) + 인접 경계에 D 텍스트"""
+def draw_roi_boxes_distances_stats(
+    img_bgr,
+    regions_orig,
+    pair_distances,
+    means,
+    covs,
+    show_full_cov=False,   # True면 3x3 전체 표시(글자 많음)
+    force_nine=True        # True면 9개 ROI/8개 거리로 강제
+):
+    vis = img_bgr.copy()
     h, w = vis.shape[:2]
 
+    if force_nine:
+        regions_orig = regions_orig[:9]
+        means = means[:9]
+        covs = covs[:9]
+        pair_distances = pair_distances[:8]
+
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = max(0.5, min(1.0, w / 2000.0))
+    font_scale = max(0.45, min(0.9, w / 2200.0))
     thickness = 2
 
-    # ROI 박스
+    # ROI 박스 + mean/cov 텍스트
     for k, (y0, y1) in enumerate(regions_orig):
         cv2.rectangle(vis, (0, y0), (w - 1, y1), (0, 255, 0), 2)
         cv2.putText(vis, f"ROI {k}", (10, max(25, y0 + 25)),
                     font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
 
-    # 거리값(경계)
+        # mean / cov 텍스트 구성
+        m = means[k]
+        c = covs[k]
+
+        # mean: (B,G,R)로 계산된 값(이미지가 BGR이기 때문)
+        mean_txt = f"mean(BGR)=({m[0]:.1f},{m[1]:.1f},{m[2]:.1f})"
+
+        # cov: 기본은 diag만 (가독성)
+        if not show_full_cov:
+            diag = np.diag(c)
+            cov_txt1 = f"cov_diag=({diag[0]:.1f},{diag[1]:.1f},{diag[2]:.1f})"
+            # 박스 내부에 2줄로 표시
+            y_text1 = min(y1 - 10, y0 + 55)
+            y_text2 = min(y1 - 10, y0 + 80)
+            cv2.putText(vis, mean_txt, (10, y_text1),
+                        font, font_scale, (0, 200, 255), thickness, cv2.LINE_AA)
+            cv2.putText(vis, cov_txt1, (10, y_text2),
+                        font, font_scale, (0, 200, 255), thickness, cv2.LINE_AA)
+        else:
+            # 3x3 전체 표시(3줄)
+            # 너무 길면 가독성 떨어질 수 있음
+            row1 = f"cov[0]=({c[0,0]:.1f},{c[0,1]:.1f},{c[0,2]:.1f})"
+            row2 = f"cov[1]=({c[1,0]:.1f},{c[1,1]:.1f},{c[1,2]:.1f})"
+            row3 = f"cov[2]=({c[2,0]:.1f},{c[2,1]:.1f},{c[2,2]:.1f})"
+            y_text1 = min(y1 - 10, y0 + 55)
+            y_text2 = min(y1 - 10, y0 + 80)
+            y_text3 = min(y1 - 10, y0 + 105)
+            y_text4 = min(y1 - 10, y0 + 130)
+            cv2.putText(vis, mean_txt, (10, y_text1),
+                        font, font_scale, (0, 200, 255), thickness, cv2.LINE_AA)
+            cv2.putText(vis, row1, (10, y_text2),
+                        font, font_scale, (0, 200, 255), thickness, cv2.LINE_AA)
+            cv2.putText(vis, row2, (10, y_text3),
+                        font, font_scale, (0, 200, 255), thickness, cv2.LINE_AA)
+            cv2.putText(vis, row3, (10, y_text4),
+                        font, font_scale, (0, 200, 255), thickness, cv2.LINE_AA)
+
+    # 경계별 Bhattacharyya 거리 텍스트
     x_text = int(w * 0.68)
     for (i, j, dist) in pair_distances:
+        if i >= len(regions_orig) - 1:
+            continue
         y_boundary = regions_orig[i][1]
         y_text = int(np.clip(y_boundary - 5, 20, h - 10))
-
         cv2.line(vis, (0, y_boundary), (w - 1, y_boundary), (255, 255, 0), 1)
         cv2.putText(vis, f"D({i}-{j})={dist:.4f}", (x_text, y_text),
                     font, font_scale, (255, 255, 0), thickness, cv2.LINE_AA)
@@ -124,41 +186,33 @@ def draw_roi_boxes_and_distances(vis, regions_orig, pair_distances):
 
 
 def draw_horizon_line(vis, horizon_result):
-    """
-    roi_using.py의 detector.detect() 결과를 받아 최종 수평선 그리기
-    - detect가 반환하는 (a, b, (x1,y1,x2,y2)) 형태에 맞춰 그림
-    """
     if horizon_result is None:
         return vis
-
-    # roi_using.py 내부 구현에 맞춰 unpack 시도
     try:
         a, b, (x1, y1, x2, y2) = horizon_result
         cv2.line(vis, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
-        # 라벨
-        cv2.putText(vis, "Horizon", (max(10, int(min(x1, x2)) + 10), max(30, int(min(y1, y2)) - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(vis, "Horizon",
+                    (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
     except Exception:
-        # 반환 형식이 다르면 조용히 스킵
         pass
-
     return vis
 
 
 def main():
     input_dir = r"C:\Users\LEEJINSE\Desktop\Horizon_detection\Algorithm_based\val_data"
 
-    # ✅ 기존 results 폴더 건드리지 않도록 새 폴더
-    out_dir = os.path.join(input_dir, "roi_overlay_with_horizon")
+    out_dir = os.path.join(input_dir, "roi_overlay_with_horizon_stats")
     os.makedirs(out_dir, exist_ok=True)
 
     detector = FastHorizonDetector(num_regions=9)
 
-    # ✅ val_data 바로 아래 jpg/jpeg만 (하위 results 제외)
+    # val_data 바로 아래 jpg/jpeg만
     img_paths = []
     img_paths += glob.glob(os.path.join(input_dir, "*.jpg"))
     img_paths += glob.glob(os.path.join(input_dir, "*.jpeg"))
 
+    # 중복 제거 + 하위폴더 제외
     img_paths = sorted(set(os.path.normcase(os.path.abspath(p)) for p in img_paths))
     input_dir_norm = os.path.normcase(os.path.abspath(input_dir))
     img_paths = [p for p in img_paths if os.path.normcase(os.path.dirname(p)) == input_dir_norm]
@@ -173,22 +227,27 @@ def main():
             print("  -> load fail, skip")
             continue
 
-        # (1) ROI/거리 계산(분석용 오버레이)
-        debug = compute_all_roi_distances(img, detector)
+        debug = compute_roi_stats_and_distances(img, detector)
         if debug is None:
             print("  -> ROI calc fail, skip")
             continue
 
-        # (2) 최종 수평선 검출(원본 알고리즘 사용)
+        # 수평선 결과(roi_using.py 원본 알고리즘)
         horizon_result = detector.detect(img)
 
-        # (3) 그리기
-        vis = img.copy()
-        vis = draw_roi_boxes_and_distances(vis, debug["regions_orig"], debug["pair_distances"])
+        # 오버레이
+        vis = draw_roi_boxes_distances_stats(
+            img,
+            debug["regions_orig"],
+            debug["pair_distances"],
+            debug["means"],
+            debug["covs"],
+            show_full_cov=False,  # 필요하면 True
+            force_nine=True
+        )
         vis = draw_horizon_line(vis, horizon_result)
 
-        # (4) 저장
-        save_path = os.path.join(out_dir, os.path.splitext(img_id)[0] + "_roi_dist_horizon.jpg")
+        save_path = os.path.join(out_dir, os.path.splitext(img_id)[0] + "_roi_dist_horizon_stats.jpg")
         imwrite_unicode(save_path, vis)
 
     print("\n[DONE] Saved overlays to:", out_dir)
