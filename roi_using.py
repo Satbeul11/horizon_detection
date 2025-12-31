@@ -10,8 +10,8 @@ class FastHorizonDetector:
         num_regions=9,          # 수평 방향으로 나눌 영역 개수 (논문에서 9 사용)
         roi_resize_factor=0.25, # ROI 검출용 리사이즈 비율 (원본의 1/4)
         scales=(1, 2, 3),       # median filter 스케일 s (커널크기 = 10*s + 1)
-        canny_thresh1=50,
-        canny_thresh2=150,
+        canny_thresh1=20, # origin 50
+        canny_thresh2=80, # origin 150
         edge_sum_thresh=170,    # 논문에서 사용한 threshold ≈ 170
         hough_threshold=10      # HoughLines 최소 투표 수, origin = 50
     ):
