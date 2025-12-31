@@ -13,7 +13,7 @@ class FastHorizonDetector:
         canny_thresh1=50,
         canny_thresh2=150,
         edge_sum_thresh=170,    # 논문에서 사용한 threshold ≈ 170
-        hough_threshold=50      # HoughLines 최소 투표 수
+        hough_threshold=10      # HoughLines 최소 투표 수, origin = 50
     ):
         self.num_regions = num_regions
         self.roi_resize_factor = roi_resize_factor
