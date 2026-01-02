@@ -2,18 +2,19 @@ import cv2
 import numpy as np
 import os
 import glob
+import math
 
 
 class FastHorizonDetector:
     def __init__(
-        self,
-        num_regions=9,          # 수평 방향으로 나눌 영역 개수 (논문에서 9 사용)
-        roi_resize_factor=0.25, # ROI 검출용 리사이즈 비율 (원본의 1/4)
-        scales=(1, 2, 3),       # median filter 스케일 s (커널크기 = 10*s + 1)
-        canny_thresh1=20, # origin 50
-        canny_thresh2=80, # origin 150
-        edge_sum_thresh=170,    # 논문에서 사용한 threshold ≈ 170
-        hough_threshold=10      # HoughLines 최소 투표 수, origin = 50
+            self,
+            num_regions=9,  # 수평 방향으로 나눌 영역 개수
+            roi_resize_factor=0.25,  # ROI 검출용 리사이즈 비율
+            scales=(1, 2, 3),  # median filter 스케일
+            canny_thresh1=20,
+            canny_thresh2=80,
+            edge_sum_thresh=170,
+            linearity_thresh=0.15  # [New] 경계선이 얼마나 직선에 가까워야 하는지 (기울기 분산 허용치)
     ):
         self.num_regions = num_regions
         self.roi_resize_factor = roi_resize_factor
@@ -21,94 +22,76 @@ class FastHorizonDetector:
         self.canny_thresh1 = canny_thresh1
         self.canny_thresh2 = canny_thresh2
         self.edge_sum_thresh = edge_sum_thresh
-        self.hough_threshold = hough_threshold
+        self.linearity_thresh = linearity_thresh  # Gradient 급격한 변화 감지용 임계값
 
     # -----------------------------
     # Public API
     # -----------------------------
     def detect(self, img_bgr):
         """
-        img_bgr: BGR(OpenCV) 이미지 (np.ndarray, uint8)
+        img_bgr: BGR 이미지
         return:
-            - (a, b, (x1, y1, x2, y2))  : y = a x + b 직선 파라미터 및 그려질 두 점 (원본 좌표계)
-            - None                      : 실패 시
+            - (a, b, (x1, y1, x2, y2)) : y = ax + b 파라미터 및 시각화용 좌표
+            - None : 검출 실패 시
         """
         if img_bgr is None or img_bgr.size == 0:
             return None
 
         h, w = img_bgr.shape[:2]
 
-        # 1. ROI 검출 (리사이즈된 이미지에서)
+        # [cite_start]1. ROI 검출 (기존 로직 유지) [cite: 17, 18, 19]
         roi_y0, roi_y1 = self._detect_roi_vertical_range(img_bgr)
-        # 안전장치: 잘못 검출된 경우 기본 중앙부 사용
         if roi_y0 >= roi_y1:
             roi_y0 = int(h * 0.3)
             roi_y1 = int(h * 0.7)
 
         roi_img = img_bgr[roi_y0:roi_y1, :]
 
-        # 2. 다중 스케일 에지 검출 및 합성
+        # [cite_start]2. 다중 스케일 에지 검출 (기존 로직 유지) [cite: 20, 21, 22]
         edge_combined = self._multi_scale_edge_map(roi_img)
         if edge_combined is None:
             return None
 
-        # 3. Hough + Median 필터 기반 outlier 제거 + 최소제곱 피팅
-        result = self._estimate_horizon_from_edges(edge_combined, roi_y0, w, h)
+        # 3. [New] Contour 기반 기하학적 수평선 추정 (조건 1~5 반영)
+        result = self._estimate_horizon_geometric(edge_combined, roi_y0, w, h)
         return result
 
     # -----------------------------
-    # 1. ROI detection
+    # 1. ROI detection (변경 없음)
     # -----------------------------
     def _detect_roi_vertical_range(self, img_bgr):
-        """
-        논문 방식에 따라 리사이즈된 이미지에서
-        수평 방향으로 N개의 겹치는 구역을 만들고,
-        인접 구역 간 Bhattacharyya distance가 가장 큰 지점을 ROI로 선택.
-        """
         h, w = img_bgr.shape[:2]
         scale = self.roi_resize_factor
 
-        # 너무 작은 이미지는 그냥 전체 사용
-        if h < 50 or w < 50:
-            return 0, h
+        if h < 50 or w < 50: return 0, h
 
         small_h = max(1, int(h * scale))
         small_w = max(1, int(w * scale))
         img_small = cv2.resize(img_bgr, (small_w, small_h), interpolation=cv2.INTER_AREA)
 
         N = self.num_regions
-        if N < 2:
-            return 0, h
+        if N < 2: return 0, h
 
-        # 50% overlap을 고려한 구역 높이, 스텝 설정
         step = small_h // (N + 1)
-        region_height = step * 2  # 대략 50% overlap
+        region_height = step * 2
 
         regions = []
         for i in range(N):
             y0 = i * step
             y1 = y0 + region_height
-            if y0 >= small_h:
-                break
+            if y0 >= small_h: break
             y1 = min(y1, small_h)
-            if y1 - y0 < 5:
-                continue
+            if y1 - y0 < 5: continue
             regions.append((y0, y1))
 
-        if len(regions) < 2:
-            return 0, h
+        if len(regions) < 2: return 0, h
 
-        # 각 구역의 mean, covariance 계산
-        means = []
-        covs = []
+        means, covs = [], []
         eps = 1e-6
-
         for (y0, y1) in regions:
             region = img_small[y0:y1, :]
-            # (N, 3)
             pixels = region.reshape(-1, 3).astype(np.float32)
             mean = np.mean(pixels, axis=0)
-            # 소규모 영역에서 cov가 singular 될 수 있어 regularization
             cov = np.cov(pixels, rowvar=False)
             if cov.shape == ():
                 cov = np.eye(3, dtype=np.float32)
@@ -116,7 +99,6 @@ class FastHorizonDetector:
             means.append(mean)
             covs.append(cov)
 
-        # 인접 구역 간 Bhattacharyya distance 유사 형태 계산
         best_dist = -1.0
         best_pair = (0, 1)
 
@@ -124,34 +106,27 @@ class FastHorizonDetector:
             m1, m2 = means[i], means[i + 1]
             S1, S2 = covs[i], covs[i + 1]
             diff = (m1 - m2).reshape(3, 1)
-            # (S1 + S2)/2 사용 (일반적인 Bhattacharyya distance 근사)
             S = 0.5 * (S1 + S2)
             try:
                 S_inv = np.linalg.inv(S)
             except np.linalg.LinAlgError:
                 S_inv = np.linalg.pinv(S)
-
-            D = float(diff.T @ S_inv @ diff)  # scalar
+            D = float(diff.T @ S_inv @ diff)
             if D > best_dist:
                 best_dist = D
                 best_pair = (i, i + 1)
 
-        # 두 구역의 합집합을 ROI로 사용
         y0_small = regions[best_pair[0]][0]
         y1_small = regions[best_pair[1]][1]
-
-        # 원본 이미지 좌표로 매핑
         y0_orig = int(y0_small / scale)
         y1_orig = int(y1_small / scale)
-
-        # 범위 보정
         y0_orig = max(0, min(y0_orig, h - 1))
         y1_orig = max(0, min(y1_orig, h))
 
         return y0_orig, y1_orig
 
     # -----------------------------
-    # 2. Multi-scale edge detection
+    # 2. Multi-scale edge detection (변경 없음)
     # -----------------------------
     def _multi_scale_edge_map(self, roi_img_bgr):
         if roi_img_bgr is None or roi_img_bgr.size == 0:
@@ -161,177 +136,188 @@ class FastHorizonDetector:
         h, w = gray.shape[:2]
 
         edge_sum = np.zeros((h, w), dtype=np.uint16)
-        edge_maps = []
 
         for s in self.scales:
-            ksize = 10 * s + 1  # 논문: i,j in [-5s,5s] → window size = 10s+1
-            # 커널 크기는 홀수이고 양수여야 한다.
-            if ksize < 3:
-                ksize = 3
-            if ksize % 2 == 0:
-                ksize += 1
+            ksize = 10 * s + 1
+            if ksize < 3: ksize = 3
+            if ksize % 2 == 0: ksize += 1
 
             smoothed = cv2.medianBlur(gray, ksize)
             edges = cv2.Canny(smoothed, self.canny_thresh1, self.canny_thresh2)
-            edge_maps.append(edges)
-            edge_sum += (edges > 0).astype(np.uint16) * 255  # 0 또는 255를 누적
+            edge_sum += (edges > 0).astype(np.uint16) * 255
 
-        # 누적된 edge map을 threshold
         edge_combined = np.zeros_like(gray, dtype=np.uint8)
         edge_combined[edge_sum >= self.edge_sum_thresh] = 255
 
         return edge_combined
 
     # -----------------------------
-    # 3. Horizon line estimation
+    # 3. Geometric Horizon Estimation (New)
     # -----------------------------
-    def _estimate_horizon_from_edges(self, edge_img, roi_y0, img_width, img_height):
+    def _estimate_horizon_geometric(self, edge_img, roi_y0, img_width, img_height):
         """
-        edge_img: ROI 영역(부분 이미지)에 대한 binary edge map (0/255)
-        roi_y0: ROI가 원본 상에서 시작되는 y좌표
-        img_width, img_height: 원본 이미지 크기
+        허프 변환 대신 Contour 분석을 사용하여 수평선을 검출합니다.
+
+        <조건 반영>
+        1. Canny 이후 경계선(Contour) 검출
+        2. Gradient 변화가 급격한(둥근 파도 등) 경계선 제외
+        3. 가장 긴 경계선 선택
+        4. 양 끝점을 기준으로 이미지 끝까지 연장 (반직선)
+        5. 결과적으로 이미지를 이분할하는 선 도출
         """
-        # Hough Transform으로 초기 직선 후보 추출
-        lines = cv2.HoughLines(edge_img, 1, np.pi / 180.0, self.hough_threshold)
-        if lines is None or len(lines) == 0:
+
+        # [조건 1] 경계선(Contour) 검출
+        # RETR_EXTERNAL: 가장 바깥쪽 라인만, CHAIN_APPROX_NONE: 모든 점 좌표 저장
+        contours, _ = cv2.findContours(edge_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+        if not contours:
             return None
 
-        # 가장 첫 번째(득표 수가 가장 높은) 직선을 사용
-        rho, theta = lines[0][0]
+        valid_contours = []
 
-        # theta가 수평에 가까운 경우만 사용 (지평선 가정)
-        if abs(np.sin(theta)) < 1e-3:
+        for cnt in contours:
+            # 점의 개수가 너무 적으면 직선 판단 불가하므로 패스 (노이즈 제거)
+            if len(cnt) < 10:
+                continue
+
+            # [조건 2] Gradient(기울기) 급격한 변화 체크
+            # 수평선은 기울기가 거의 일정해야 함. 백파(whitecap)는 둥글어서 기울기가 급변함.
+            if self._check_gradient_stability(cnt):
+                valid_contours.append(cnt)
+
+        if not valid_contours:
             return None
 
-        # 후보 직선: x cosθ + y sinθ = ρ → y = (ρ - x cosθ) / sinθ
-        cos_t = np.cos(theta)
-        sin_t = np.sin(theta)
+        # [조건 3] 가장 긴 점의 집합(경계선) 선택
+        # cv2.arcLength로 길이를 측정하여 가장 긴 것 선택
+        best_cnt = max(valid_contours, key=lambda c: cv2.arcLength(c, False))
 
-        # edge 점들 좌표 수집 (ROI 좌표계)
-        ys, xs = np.where(edge_img > 0)
-        if len(xs) < 10:
-            return None
+        # 좌표 처리를 위해 차원 축소 및 X축 기준 정렬
+        # Contour는 (N, 1, 2) 형태이므로 (N, 2)로 변환
+        pts = best_cnt.squeeze()
 
-        xs_float = xs.astype(np.float32)
-        ys_float = ys.astype(np.float32)
+        # x좌표 기준으로 정렬 (0~n 순서 보장)
+        pts = pts[pts[:, 0].argsort()]
 
-        # 각 점에 대한 후보 직선에서의 예측 y
-        y_pred = (rho - xs_float * cos_t) / (sin_t + 1e-6)
-        residuals = ys_float - y_pred
+        n = len(pts)
+        if n < 2: return None
 
-        # Median absolute deviation을 이용한 inlier 선택
-        abs_res = np.abs(residuals)
-        med_abs = np.median(abs_res)
-        if med_abs < 1.0:
-            med_abs = 1.0  # 너무 작으면 최소 폭 보장
+        # [조건 4] 끝 점을 이용한 연장 (반직선)
+        # 0, 1번째 점을 잇는 선 -> 왼쪽 끝(x=0)으로 연장
+        # n-2, n-1번째 점을 잇는 선 -> 오른쪽 끝(x=Width)으로 연장
 
-        inlier_mask = abs_res <= (1.5 * med_abs)
-        if np.sum(inlier_mask) < 10:
-            # inlier가 너무 적으면 실패로 처리
-            return None
+        p0 = pts[0]  # 0번째 점 (x가 가장 작은 점)
+        p1 = pts[1]  # 1번째 점
 
-        xs_in = xs_float[inlier_mask]
-        ys_in = ys_float[inlier_mask]
+        pn = pts[-1]  # n번째 점 (x가 가장 큰 점)
+        pn_1 = pts[-2]  # n-1번째 점
 
-        # 최소제곱 직선 피팅: y = a x + b (ROI 좌표계)
-        A = np.vstack([xs_in, np.ones_like(xs_in)]).T
-        try:
-            (a, b), *_ = np.linalg.lstsq(A, ys_in, rcond=None)
-        except np.linalg.LinAlgError:
-            return None
+        # 4-1. 왼쪽 확장: (p1 -> p0) 방향 벡터를 x=0까지 연장
+        left_y = self._extrapolate_y(p1, p0, 0)
 
-        # 원본 좌표계로 변환: y_global = a * x + (b + roi_y0)
-        b_global = b + roi_y0
+        # 4-2. 오른쪽 확장: (pn_1 -> pn) 방향 벡터를 x=img_width까지 연장
+        right_y = self._extrapolate_y(pn_1, pn, img_width - 1)
 
-        # 시각화를 위한 두 점 (x=0, x=img_width-1 기준)
-        x1, x2 = 0, img_width - 1
-        y1 = a * x1 + b_global
-        y2 = a * x2 + b_global
+        # ROI 좌표계(roi_y0)를 전체 이미지 좌표계로 변환
+        left_y_global = left_y + roi_y0
+        right_y_global = right_y + roi_y0
 
-        # 화면 밖을 벗어나더라도 clipping
-        y1 = float(np.clip(y1, 0, img_height - 1))
-        y2 = float(np.clip(y2, 0, img_height - 1))
+        # 화면 밖으로 나가는 것 클리핑 (옵션)
+        left_y_global = np.clip(left_y_global, 0, img_height)
+        right_y_global = np.clip(right_y_global, 0, img_height)
 
-        return float(a), float(b_global), (int(x1), int(round(y1)), int(x2), int(round(y2)))
+        # [조건 5] 이미지를 이분할 (결과 반환)
+        # detect 함수의 반환 규격인 y = ax + b 형태로 변환
+        # (0, left_y_global) 과 (W-1, right_y_global) 두 점을 잇는 직선 방정식 구하기
 
-def run_on_val_folder():
-    # 입력 폴더 경로
-    input_dir = r"C:\Users\LEEJINSE\Desktop\Horizon_detection\Algorithm_based\val_data"
+        dx = (img_width - 1) - 0
+        dy = right_y_global - left_y_global
 
-    # ✅ val_data 안에 results 폴더 만들기
-    output_dir = os.path.join(input_dir, "results")
-    os.makedirs(output_dir, exist_ok=True)
+        if dx == 0: return None  # 수직선 예외처리
 
-    print("[INFO] 결과 저장 폴더:", output_dir)
+        a = dy / dx
+        b = left_y_global  # x=0 일 때의 y절편
 
-    detector = FastHorizonDetector()
+        # 시각화용 좌표 (정수형)
+        x1, y1 = 0, int(round(left_y_global))
+        x2, y2 = img_width - 1, int(round(right_y_global))
 
-    # 확장자 대소문자 둘 다 처리
-    img_paths = []
-    img_paths.extend(glob.glob(os.path.join(input_dir, "*.jpg")))
-    img_paths.extend(glob.glob(os.path.join(input_dir, "*.JPG")))
+        return float(a), float(b), (x1, y1, x2, y2)
 
-    print(f"총 {len(img_paths)}장의 이미지를 처리합니다.")
+    def _check_gradient_stability(self, cnt):
+        """
+        [조건 2 구현 함수]
+        경계선을 구성하는 점들의 Gradient(순간 기울기)를 구하고,
+        이 값이 급격하게 변하는지(분산/표준편차) 확인하여 필터링합니다.
+        """
+        pts = cnt.squeeze()
 
-    # 한글 파일명 지원용 로더
-    def imread_unicode(path):
-        stream = np.fromfile(path, dtype=np.uint8)
-        img = cv2.imdecode(stream, cv2.IMREAD_COLOR)
-        return img
+        # 노이즈를 줄이기 위해 점을 일정 간격(step)으로 건너뛰며 기울기 계산
+        step = 5
+        if len(pts) < step * 2:
+            step = 1
 
-    def imwrite_unicode(path, img):
-        import os
-        import numpy as np
-        ext = os.path.splitext(path)[1]  # ".jpg" 같은 확장자
-        # 이미지 → 메모리 버퍼(바이너리)로 인코딩
-        success, buf = cv2.imencode(ext, img)
-        if not success:
+        slopes = []
+        for i in range(0, len(pts) - step, step):
+            p_cur = pts[i]
+            p_next = pts[i + step]
+
+            dx = p_next[0] - p_cur[0]
+            dy = p_next[1] - p_cur[1]
+
+            # 수직선(dx=0)에 가까우면 기울기가 무한대가 되므로 큰 값 처리
+            if dx == 0:
+                angle = 90.0  # 혹은 매우 큰 기울기
+            else:
+                slope = dy / dx
+                # 기울기(dy/dx) 자체보다는 각도(arctan)를 쓰는 것이 변화량 체크에 유리함
+                angle = math.degrees(math.atan(slope))
+
+            slopes.append(angle)
+
+        if not slopes:
             return False
-        # 유니코드 경로에 안전하게 쓰기
-        buf.tofile(path)
+
+        # 각도의 표준편차 계산
+        # 수평선은 거의 일직선이므로 각도 변화가 적어야 함 (std 낮음)
+        # 파도나 둥근 물체는 각도가 계속 변하므로 std 높음
+        std_dev = np.std(slopes)
+
+        # 수평선은 대체로 0도 근처여야 함 (평균 각도 체크 옵션)
+        mean_angle = np.mean(slopes)
+
+        # 임계값: 표준편차가 작아야 하고(직선), 평균 각도도 너무 수직이면 안됨(수평선 가정)
+        # linearity_thresh는 생성자에서 조절 가능 (기본값 설정 필요)
+        # 여기서는 각도(degree) 기준 대략 10~20도 이상 꺾이면 제외
+        if std_dev > 10.0:
+            return False
+
+        if abs(mean_angle) > 45.0:  # 수평선이 45도 이상 기울어질 리 없다고 가정
+            return False
+
         return True
 
-    for idx, img_path in enumerate(sorted(img_paths), start=1):
-        print(f"[{idx}/{len(img_paths)}] {img_path}")
+    def _extrapolate_y(self, p_start, p_end, target_x):
+        """
+        [조건 4 구현 함수]
+        두 점(p_start -> p_end)을 잇는 직선 상에서 target_x일 때의 y좌표를 구함
+        """
+        x1, y1 = p_start
+        x2, y2 = p_end
 
-        img = imread_unicode(img_path)
-        if img is None:
-            print("  -> 이미지 로드 실패, 건너뜀")
-            continue
+        dx = x2 - x1
+        dy = y2 - y1
 
-        result = detector.detect(img)
+        if dx == 0:
+            return y2  # 수직선이면 y값 그대로 반환
 
-        if result is None:
-            print("  -> Horizon detection 실패, 원본만 저장")
-            vis = img.copy()
-        else:
-            a, b, (x1, y1, x2, y2) = result
-            print(f"  -> y = {a:.4f} x + {b:.2f}")
-            vis = img.copy()
-            cv2.line(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        slope = dy / dx
 
-        save_name = os.path.basename(img_path)
-        save_path = os.path.join(output_dir, save_name)
-
-        ok = imwrite_unicode(save_path, vis)
-        print(f"  -> 저장 시도: {save_path}, 성공 여부: {ok}")
+        # y - y2 = m(x - x2)  =>  y = m(x - x2) + y2
+        target_y = slope * (target_x - x2) + y2
+        return target_y
 
 
-# -----------------------------
-# 사용 예시 (참고용)
-# -----------------------------
 if __name__ == "__main__":
-    # 이미지 읽기
-    run_on_val_folder()
-
-    if result is not None:
-        a, b, (x1, y1, x2, y2) = result
-        print(f"Horizon line: y = {a:.4f} x + {b:.2f}")
-        # 시각화
-        vis = img.copy()
-        cv2.line(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.imshow("Horizon Detection", vis)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-    else:
-        print("Horizon detection failed.")
+    # 간단한 테스트 실행
+    print("수정된 roi_using.py 모듈입니다. analysis.py에서 import하여 사용하세요.")
