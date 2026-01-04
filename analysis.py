@@ -232,7 +232,7 @@ def draw_horizon_line(vis, horizon_result):
 def main():
     # 경로 설정 (사용자 환경에 맞게)
     input_dir = r"C:\Users\user\OneDrive - 국립한국해양대학교\바탕 화면\Projects\horizon_o\island_x\select(200)"
-    out_dir = os.path.join(input_dir, "컨투어 조건 버전")
+    out_dir = os.path.join(input_dir, "컨투어 조건 버전(수정)")
     os.makedirs(out_dir, exist_ok=True)
 
     detector = FastHorizonDetector(num_regions=9)

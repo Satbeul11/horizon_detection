@@ -60,8 +60,7 @@ class FastHorizonDetector:
         if edge_combined is None:
             return None
 
-        # 3. [Modified] 굴곡과 직선이 혼합된 최종 수평선 추출
-        # 반환값: (기울기근사, y절편근사, 전체_좌표_배열)
+        # 3. 굴곡과 직선이 혼합된 최종 수평선 추출
         result = self._estimate_horizon_geometric(edge_combined, angle_combined, roi_y0, w, h)
         return result
 
@@ -186,7 +185,7 @@ class FastHorizonDetector:
             else:
                 return None
 
-        # --- [Modified] 굴곡이 유지된 중간 + 양 끝 직선 연장 ---
+        # --- 굴곡이 유지된 중간 + 양 끝 직선 연장 ---
         
         # 1) Contour 좌표 정리 (X축 기준 정렬)
         pts = best_cnt.squeeze()
@@ -194,39 +193,64 @@ class FastHorizonDetector:
         pts = pts[pts[:, 0].argsort()] 
 
         # 2) 전역 좌표(Global Coordinates)로 변환
-        # ROI 내부 좌표이므로 roi_y0를 더해줘야 전체 이미지 좌표가 됨
         pts_global = pts.astype(np.float32)
         pts_global[:, 1] += roi_y0
 
-        # 3) 왼쪽 확장 (직선)
-        # 가장 왼쪽 두 점을 사용하여 기울기 계산 -> x=0까지 연장
-        p0 = pts_global[0] # 가장 왼쪽 점
-        p1 = pts_global[1] # 두 번째 왼쪽 점
-        left_y_global = self._extrapolate_y(p1, p0, 0)
+        # [Modified] 양 끝 10% 데이터를 이용한 Trend Line 기울기 계산
+        num_pts = len(pts_global)
+        # 최소 2개 이상, 전체의 10% 개수 (최소 2개는 있어야 기울기 계산 가능)
+        subset_len = max(2, int(num_pts * 0.10))
         
-        # 4) 오른쪽 확장 (직선)
-        # 가장 오른쪽 두 점을 사용하여 기울기 계산 -> x=W-1까지 연장
-        pn = pts_global[-1]   # 가장 오른쪽 점
-        pn_1 = pts_global[-2] # 두 번째 오른쪽 점
-        right_y_global = self._extrapolate_y(pn_1, pn, img_width - 1)
+        # --- 3) 왼쪽 확장 ---
+        # 왼쪽 10% 포인트 가져오기
+        left_segment = pts_global[:subset_len]
+        
+        # Linear Regression (np.polyfit)으로 기울기(m) 계산
+        # 1차 함수 y = mx + c
+        if len(left_segment) >= 2:
+            m_left, _ = np.polyfit(left_segment[:, 0], left_segment[:, 1], 1)
+        else:
+            # 혹시 모를 예외 처리 (그냥 두 점 기울기)
+            p0, p1 = pts_global[0], pts_global[1]
+            dx = p1[0] - p0[0]
+            m_left = (p1[1] - p0[1]) / dx if dx != 0 else 0
+            
+        # x=0 까지 연장 (기준점은 Contour의 가장 왼쪽 점인 pts_global[0])
+        # 공식: y = m * (x_target - x_ref) + y_ref
+        p_start_ref = pts_global[0]
+        left_y_global = m_left * (0 - p_start_ref[0]) + p_start_ref[1]
+
+        
+        # --- 4) 오른쪽 확장 ---
+        # 오른쪽 10% 포인트 가져오기
+        right_segment = pts_global[-subset_len:]
+        
+        # 기울기(m) 계산
+        if len(right_segment) >= 2:
+            m_right, _ = np.polyfit(right_segment[:, 0], right_segment[:, 1], 1)
+        else:
+            pn, pn_1 = pts_global[-1], pts_global[-2]
+            dx = pn[0] - pn_1[0]
+            m_right = (pn[1] - pn_1[1]) / dx if dx != 0 else 0
+            
+        # x=Width-1 까지 연장 (기준점은 Contour의 가장 오른쪽 점인 pts_global[-1])
+        p_end_ref = pts_global[-1]
+        right_y_global = m_right * ((img_width - 1) - p_end_ref[0]) + p_end_ref[1]
+
 
         # 5) 점 합치기: [Left_Point] + [Contour_Points] + [Right_Point]
         left_pt = np.array([[0, left_y_global]], dtype=np.float32)
         right_pt = np.array([[img_width - 1, right_y_global]], dtype=np.float32)
         
-        # 최종 좌표 배열 (N x 2)
         full_line_pts = np.concatenate((left_pt, pts_global, right_pt), axis=0)
-        full_line_pts = full_line_pts.astype(np.int32) # 정수형 변환
+        full_line_pts = full_line_pts.astype(np.int32)
 
-        # 6) 반환값 구성
-        # a, b는 전체를 대표하는 직선의 근사치(시작점과 끝점 기준)로 남겨둠 (호환성용)
+        # 6) 반환값 구성 (기존 호환성 유지)
         dy = right_y_global - left_y_global
         dx = img_width - 1
         a = dy / dx if dx != 0 else 0
         b = left_y_global
 
-        # **중요**: 마지막 반환값이 이제 (x1,y1,x2,y2) 튜플이 아니라 
-        # 전체 경로를 담은 'numpy array'입니다.
         return float(a), float(b), full_line_pts
 
     def _calculate_angle_std(self, cnt, angle_map):
@@ -258,6 +282,8 @@ class FastHorizonDetector:
         return std_dev
 
     def _extrapolate_y(self, p_start, p_end, target_x):
+        # 이제 이 함수는 직접 사용되지 않고 np.polyfit 로직으로 대체되었으나, 
+        # 클래스 내 유틸리티로 남겨둠
         x1, y1 = p_start
         x2, y2 = p_end
         dx = x2 - x1
@@ -267,4 +293,4 @@ class FastHorizonDetector:
         return slope * (target_x - x2) + y2
 
 if __name__ == "__main__":
-    print("Updated roi_using.py: Returns full polyline (Linear Ext + Curved Middle).")
+    print("Updated roi_using.py: 10% Slope Extrapolation.")
