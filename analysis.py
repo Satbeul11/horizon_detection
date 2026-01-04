@@ -118,9 +118,24 @@ def overlay_edges_on_full_image(vis, roi_y0, roi_y1, edge_combined, alpha=0.55):
         edge_combined_rs = cv2.resize(edge_combined, (roi_vis.shape[1], roi_vis.shape[0]), interpolation=cv2.INTER_NEAREST)
         mask = edge_combined_rs > 0
 
+# -------------------------------------------------------------
+    # [추가된 부분] 점/선 두께 키우기 (Dilation)
+    # -------------------------------------------------------------
+    # thickness 값: 3 -> 5 -> 7 처럼 홀수로 늘릴수록 더 두꺼워집니다.
+    thickness = 3  
+    kernel = np.ones((thickness, thickness), np.uint8)
+    
+    # boolean 마스크를 숫자(0, 1)로 변환하여 팽창 실행
+    mask_uint8 = mask.astype(np.uint8)
+    mask_dilated = cv2.dilate(mask_uint8, kernel, iterations=1)
+    
+    # 팽창된 결과를 다시 마스크로 적용
+    mask = (mask_dilated > 0)
+    # -------------------------------------------------------------
+
     # edge 색 (BGR) - 핑크/마젠타 계열로 표시
     color = np.zeros_like(roi_vis, dtype=np.uint8)
-    color[mask] = (255, 0, 255)
+    color[mask] = (100, 255, 255)
 
     blended = cv2.addWeighted(roi_vis, 1 - alpha, color, alpha, 0)
     vis[roi_y0:roi_y1, :] = blended
@@ -200,7 +215,7 @@ def draw_horizon_line(vis, horizon_result):
         if isinstance(pts_val, np.ndarray):
             # Polyline 그리기
             # pts_val shape: (N, 2)
-            cv2.polylines(vis, [pts_val], isClosed=False, color=(0, 0, 255), thickness=3)
+            cv2.polylines(vis, [pts_val], isClosed=False, color=(0, 0, 255), thickness=2)
         else:
             # 혹시 구버전 튜플 (x1,y1,x2,y2)일 경우를 대비한 fallback
             (x1, y1, x2, y2) = pts_val
