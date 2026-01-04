@@ -4,17 +4,26 @@ import os
 import glob
 import math
 
+# custom_canny 모듈 import (같은 폴더에 위치해야 함)
+try:
+    from custom_canny import GradientCannyDetector
+except ImportError:
+    print("Warning: custom_canny.py not found. Using default Canny.")
+    GradientCannyDetector = None
 
 class FastHorizonDetector:
     def __init__(
             self,
-            num_regions=9,  # 수평 방향으로 나눌 영역 개수
-            roi_resize_factor=0.25,  # ROI 검출용 리사이즈 비율
-            scales=(1, 2, 3),  # median filter 스케일
-            canny_thresh1=20,
-            canny_thresh2=80,
-            edge_sum_thresh=170,
-            linearity_thresh=0.15  # [New] 경계선이 얼마나 직선에 가까워야 하는지 (기울기 분산 허용치)
+            num_regions=4,
+            roi_resize_factor=0.2023,
+            scales=(1, 2, 3),  # 기존 Multi-scale 유지
+            canny_thresh1=76,
+            canny_thresh2=147,
+            edge_sum_thresh=148, # Multi-scale 합산 임계값
+            # [New] 조건 필터링용 변수
+            top_n_contours=5,       # 길이 상위 N개 후보 검사
+            angle_std_thresh=20.0,  # Angle 표준편차 허용치 (낮을수록 일직선/일정한 패턴)
+            target_angle=90.0       # (옵션) 수평선이 가져야 할 이상적인 Gradient 각도 (보통 수직방향 90/270)
     ):
         self.num_regions = num_regions
         self.roi_resize_factor = roi_resize_factor
@@ -22,47 +31,54 @@ class FastHorizonDetector:
         self.canny_thresh1 = canny_thresh1
         self.canny_thresh2 = canny_thresh2
         self.edge_sum_thresh = edge_sum_thresh
-        self.linearity_thresh = linearity_thresh  # Gradient 급격한 변화 감지용 임계값
+        
+        # 필터링 파라미터
+        self.top_n_contours = top_n_contours
+        self.angle_std_thresh = angle_std_thresh
+        self.target_angle = target_angle
+
+        # Custom Detector 초기화
+        if GradientCannyDetector:
+            # 내부 blur_ksize는 5로 설정하되, 외부에서 medianBlur된 이미지가 들어오므로 
+            # custom_canny 내부의 GaussianBlur 영향은 미미하거나 보정 역할을 함
+            self.canny_detector = GradientCannyDetector(ksize=3, blur_ksize=5)
+        else:
+            self.canny_detector = None
 
     # -----------------------------
     # Public API
     # -----------------------------
     def detect(self, img_bgr):
-        """
-        img_bgr: BGR 이미지
-        return:
-            - (a, b, (x1, y1, x2, y2)) : y = ax + b 파라미터 및 시각화용 좌표
-            - None : 검출 실패 시
-        """
         if img_bgr is None or img_bgr.size == 0:
             return None
 
         h, w = img_bgr.shape[:2]
 
-        # [cite_start]1. ROI 검출 (기존 로직 유지) [cite: 17, 18, 19]
+        # 1. ROI 검출 (기존 로직)
         roi_y0, roi_y1 = self._detect_roi_vertical_range(img_bgr)
-        if roi_y0 >= roi_y1:
+        if roi_y0 >= roi_y1: # 예외 처리
             roi_y0 = int(h * 0.3)
             roi_y1 = int(h * 0.7)
 
         roi_img = img_bgr[roi_y0:roi_y1, :]
 
-        # [cite_start]2. 다중 스케일 에지 검출 (기존 로직 유지) [cite: 20, 21, 22]
-        edge_combined = self._multi_scale_edge_map(roi_img)
+        # 2. [Modified] Multi-scale Edge & Angle Map 생성
+        edge_combined, angle_combined = self._multi_scale_edge_map(roi_img)
+        
         if edge_combined is None:
             return None
 
-        # 3. [New] Contour 기반 기하학적 수평선 추정 (조건 1~5 반영)
-        result = self._estimate_horizon_geometric(edge_combined, roi_y0, w, h)
+        # 3. [Modified] 조건(길이, Angle 편차)을 반영한 수평선 추정
+        result = self._estimate_horizon_geometric(edge_combined, angle_combined, roi_y0, w, h)
         return result
 
     # -----------------------------
-    # 1. ROI detection (변경 없음)
+    # 1. ROI detection (기존 유지)
     # -----------------------------
     def _detect_roi_vertical_range(self, img_bgr):
+        # (기존 코드와 로직 동일)
         h, w = img_bgr.shape[:2]
         scale = self.roi_resize_factor
-
         if h < 50 or w < 50: return 0, h
 
         small_h = max(1, int(h * scale))
@@ -71,10 +87,8 @@ class FastHorizonDetector:
 
         N = self.num_regions
         if N < 2: return 0, h
-
         step = small_h // (N + 1)
         region_height = step * 2
-
         regions = []
         for i in range(N):
             y0 = i * step
@@ -83,7 +97,6 @@ class FastHorizonDetector:
             y1 = min(y1, small_h)
             if y1 - y0 < 5: continue
             regions.append((y0, y1))
-
         if len(regions) < 2: return 0, h
 
         means, covs = [], []
@@ -91,17 +104,13 @@ class FastHorizonDetector:
         for (y0, y1) in regions:
             region = img_small[y0:y1, :]
             pixels = region.reshape(-1, 3).astype(np.float32)
-            mean = np.mean(pixels, axis=0)
+            means.append(np.mean(pixels, axis=0))
             cov = np.cov(pixels, rowvar=False)
-            if cov.shape == ():
-                cov = np.eye(3, dtype=np.float32)
-            cov = cov + eps * np.eye(3, dtype=np.float32)
-            means.append(mean)
-            covs.append(cov)
+            if cov.shape == (): cov = np.eye(3, dtype=np.float32)
+            covs.append(cov + eps * np.eye(3, dtype=np.float32))
 
         best_dist = -1.0
         best_pair = (0, 1)
-
         for i in range(len(regions) - 1):
             m1, m2 = means[i], means[i + 1]
             S1, S2 = covs[i], covs[i + 1]
@@ -109,215 +118,197 @@ class FastHorizonDetector:
             S = 0.5 * (S1 + S2)
             try:
                 S_inv = np.linalg.inv(S)
-            except np.linalg.LinAlgError:
+            except:
                 S_inv = np.linalg.pinv(S)
             D = float(diff.T @ S_inv @ diff)
             if D > best_dist:
                 best_dist = D
                 best_pair = (i, i + 1)
 
-        y0_small = regions[best_pair[0]][0]
-        y1_small = regions[best_pair[1]][1]
-        y0_orig = int(y0_small / scale)
-        y1_orig = int(y1_small / scale)
-        y0_orig = max(0, min(y0_orig, h - 1))
-        y1_orig = max(0, min(y1_orig, h))
-
-        return y0_orig, y1_orig
+        y0_orig = int(regions[best_pair[0]][0] / scale)
+        y1_orig = int(regions[best_pair[1]][1] / scale)
+        return max(0, min(y0_orig, h - 1)), max(0, min(y1_orig, h))
 
     # -----------------------------
-    # 2. Multi-scale edge detection (변경 없음)
+    # 2. Multi-scale edge detection (수정됨: Custom Canny + Angle)
     # -----------------------------
     def _multi_scale_edge_map(self, roi_img_bgr):
         if roi_img_bgr is None or roi_img_bgr.size == 0:
-            return None
+            return None, None
 
+        # 입력은 BGR이지만 MedianBlur 등을 위해 Gray 변환
         gray = cv2.cvtColor(roi_img_bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
 
         edge_sum = np.zeros((h, w), dtype=np.uint16)
+        
+        # Angle 값을 저장할 맵 (초기값 -1)
+        # 여러 스케일 중 Edge가 검출된 곳의 Angle을 기록합니다.
+        # 나중 스케일(더 큰 Blur)의 Angle이 덮어쓰는 구조로 하여 노이즈를 줄입니다.
+        full_angle_map = np.zeros((h, w), dtype=np.float32) - 1
 
         for s in self.scales:
+            # [기존 로직 유지] Median Blur 커널 크기 계산
             ksize = 10 * s + 1
             if ksize < 3: ksize = 3
             if ksize % 2 == 0: ksize += 1
 
             smoothed = cv2.medianBlur(gray, ksize)
-            edges = cv2.Canny(smoothed, self.canny_thresh1, self.canny_thresh2)
-            edge_sum += (edges > 0).astype(np.uint16) * 255
 
+            # [수정] cv2.Canny -> custom_canny.detect
+            if self.canny_detector:
+                # smoothed 이미지를 입력으로 넣음
+                # custom_canny 내부적으로 GaussianBlur가 한번 더 돌지만, 
+                # 노이즈 억제 측면에서 큰 문제 없음.
+                edges, _, angles = self.canny_detector.detect(smoothed, self.canny_thresh1, self.canny_thresh2)
+            else:
+                # fallback (custom_canny 없을 때)
+                edges = cv2.Canny(smoothed, self.canny_thresh1, self.canny_thresh2)
+                angles = np.zeros_like(gray, dtype=np.float32)
+
+            # Edge 누적
+            mask = (edges > 0)
+            edge_sum += mask.astype(np.uint16) * 255
+            
+            # Angle 정보 저장 (Edge가 있는 위치만 업데이트)
+            # 스케일이 커질수록(루프 뒤쪽) 더 굵직한 구조의 Angle이 남게 됨
+            if self.canny_detector:
+                full_angle_map[mask] = angles[mask]
+
+        # [기존 로직 유지] Thresholding
         edge_combined = np.zeros_like(gray, dtype=np.uint8)
-        edge_combined[edge_sum >= self.edge_sum_thresh] = 255
+        valid_mask = (edge_sum >= self.edge_sum_thresh)
+        edge_combined[valid_mask] = 255
+        
+        # 최종 Edge가 살아남은 곳의 Angle만 남김 (나머지는 0 처리)
+        final_angle_map = np.zeros_like(full_angle_map)
+        final_angle_map[valid_mask] = full_angle_map[valid_mask]
 
-        return edge_combined
+        return edge_combined, final_angle_map
 
     # -----------------------------
-    # 3. Geometric Horizon Estimation (New)
+    # 3. Geometric Horizon Estimation (수정됨: 조건 1,2,3 적용)
     # -----------------------------
-    def _estimate_horizon_geometric(self, edge_img, roi_y0, img_width, img_height):
-        """
-        허프 변환 대신 Contour 분석을 사용하여 수평선을 검출합니다.
-
-        <조건 반영>
-        1. Canny 이후 경계선(Contour) 검출
-        2. Gradient 변화가 급격한(둥근 파도 등) 경계선 제외
-        3. 가장 긴 경계선 선택
-        4. 양 끝점을 기준으로 이미지 끝까지 연장 (반직선)
-        5. 결과적으로 이미지를 이분할하는 선 도출
-        """
-
-        # [조건 1] 경계선(Contour) 검출
-        # RETR_EXTERNAL: 가장 바깥쪽 라인만, CHAIN_APPROX_NONE: 모든 점 좌표 저장
+    def _estimate_horizon_geometric(self, edge_img, angle_map, roi_y0, img_width, img_height):
+        # [조건 1] Contour 검출
         contours, _ = cv2.findContours(edge_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
         if not contours:
             return None
 
-        valid_contours = []
+        # [조건 2] 길이 기준 정렬 후 상위 N개 추출
+        # 윤슬 등 작은 노이즈들은 길이가 짧아 여기서 대부분 탈락
+        contours = sorted(contours, key=lambda c: cv2.arcLength(c, False), reverse=True)
+        candidates = contours[:self.top_n_contours]
 
-        for cnt in contours:
-            # 점의 개수가 너무 적으면 직선 판단 불가하므로 패스 (노이즈 제거)
-            if len(cnt) < 10:
+        best_cnt = None
+        min_std_score = float('inf') # 편차는 작을수록 좋음
+
+        for cnt in candidates:
+            # 너무 짧은 선은 제외
+            if len(cnt) < 20: 
                 continue
 
-            # [조건 2] Gradient(기울기) 급격한 변화 체크
-            # 수평선은 기울기가 거의 일정해야 함. 백파(whitecap)는 둥글어서 기울기가 급변함.
-            if self._check_gradient_stability(cnt):
-                valid_contours.append(cnt)
+            # [조건 3] Angle 편차 확인
+            std_dev = self._calculate_angle_std(cnt, angle_map)
+            
+            # 디버깅용 출력 (필요시 주석 해제)
+            # print(f"Contour len: {len(cnt)}, Angle Std: {std_dev:.2f}")
 
-        if not valid_contours:
-            return None
+            # 편차가 임계값보다 작아야 함 (직선/완만한 곡선 형태)
+            if std_dev < self.angle_std_thresh:
+                # 여기서 추가로 평균 각도(Mean Angle)를 체크하여 수평선(90도 근처)인지 볼 수도 있음.
+                # 우선은 편차가 가장 작은(가장 매끄러운) 선을 선택
+                if std_dev < min_std_score:
+                    min_std_score = std_dev
+                    best_cnt = cnt
 
-        # [조건 3] 가장 긴 점의 집합(경계선) 선택
-        # cv2.arcLength로 길이를 측정하여 가장 긴 것 선택
-        best_cnt = max(valid_contours, key=lambda c: cv2.arcLength(c, False))
+        # 만약 조건을 만족하는 것이 하나도 없다면?
+        # -> fallback: 그냥 가장 긴 놈을 쓰거나, None 리턴
+        if best_cnt is None:
+            # 안전장치: 편차 조건이 너무 빡빡해서 실패했다면 그냥 1순위 길이 사용 (옵션)
+            if candidates and len(candidates[0]) > 50:
+                best_cnt = candidates[0]
+            else:
+                return None
 
-        # 좌표 처리를 위해 차원 축소 및 X축 기준 정렬
-        # Contour는 (N, 1, 2) 형태이므로 (N, 2)로 변환
+        # 이하: 양 끝점 연장 및 직선 방정식 도출 (기존 로직)
         pts = best_cnt.squeeze()
+        if pts.ndim == 1: pts = pts.reshape(-1, 2)
+        pts = pts[pts[:, 0].argsort()] # X축 정렬
 
-        # x좌표 기준으로 정렬 (0~n 순서 보장)
-        pts = pts[pts[:, 0].argsort()]
+        p0 = pts[0]
+        p1 = pts[1] # 시작점 부근 방향
+        pn = pts[-1]
+        pn_1 = pts[-2] # 끝점 부근 방향
 
-        n = len(pts)
-        if n < 2: return None
-
-        # [조건 4] 끝 점을 이용한 연장 (반직선)
-        # 0, 1번째 점을 잇는 선 -> 왼쪽 끝(x=0)으로 연장
-        # n-2, n-1번째 점을 잇는 선 -> 오른쪽 끝(x=Width)으로 연장
-
-        p0 = pts[0]  # 0번째 점 (x가 가장 작은 점)
-        p1 = pts[1]  # 1번째 점
-
-        pn = pts[-1]  # n번째 점 (x가 가장 큰 점)
-        pn_1 = pts[-2]  # n-1번째 점
-
-        # 4-1. 왼쪽 확장: (p1 -> p0) 방향 벡터를 x=0까지 연장
+        # 조금 더 안정적인 기울기 추정을 위해 양 끝 10% 지점 등을 쓸 수도 있으나,
+        # 여기선 기존 로직대로 바로 옆 점을 사용 (직선성이 보장된다면 OK)
         left_y = self._extrapolate_y(p1, p0, 0)
-
-        # 4-2. 오른쪽 확장: (pn_1 -> pn) 방향 벡터를 x=img_width까지 연장
         right_y = self._extrapolate_y(pn_1, pn, img_width - 1)
 
-        # ROI 좌표계(roi_y0)를 전체 이미지 좌표계로 변환
-        left_y_global = left_y + roi_y0
-        right_y_global = right_y + roi_y0
+        left_y_global = np.clip(left_y + roi_y0, 0, img_height)
+        right_y_global = np.clip(right_y + roi_y0, 0, img_height)
 
-        # 화면 밖으로 나가는 것 클리핑 (옵션)
-        left_y_global = np.clip(left_y_global, 0, img_height)
-        right_y_global = np.clip(right_y_global, 0, img_height)
-
-        # [조건 5] 이미지를 이분할 (결과 반환)
-        # detect 함수의 반환 규격인 y = ax + b 형태로 변환
-        # (0, left_y_global) 과 (W-1, right_y_global) 두 점을 잇는 직선 방정식 구하기
-
-        dx = (img_width - 1) - 0
+        dx = (img_width - 1)
         dy = right_y_global - left_y_global
-
-        if dx == 0: return None  # 수직선 예외처리
-
+        
+        if dx == 0: return None
         a = dy / dx
-        b = left_y_global  # x=0 일 때의 y절편
+        b = left_y_global
 
-        # 시각화용 좌표 (정수형)
         x1, y1 = 0, int(round(left_y_global))
         x2, y2 = img_width - 1, int(round(right_y_global))
 
         return float(a), float(b), (x1, y1, x2, y2)
 
-    def _check_gradient_stability(self, cnt):
+    def _calculate_angle_std(self, cnt, angle_map):
         """
-        [조건 2 구현 함수]
-        경계선을 구성하는 점들의 Gradient(순간 기울기)를 구하고,
-        이 값이 급격하게 변하는지(분산/표준편차) 확인하여 필터링합니다.
+        Contour 픽셀들의 Angle 표준편차를 계산합니다.
+        0도와 360도가 붙어있는 Circular 성질을 고려합니다.
         """
-        pts = cnt.squeeze()
+        angles = []
+        h, w = angle_map.shape
+        
+        # 샘플링 스텝 (속도 최적화)
+        step = 1
+        for i in range(0, len(cnt), step):
+            p = cnt[i][0]
+            x, y = p[0], p[1]
+            if 0 <= x < w and 0 <= y < h:
+                a = angle_map[y, x]
+                # Angle이 유효한 값인지 체크 (배경 0 또는 초기값 -1 제외)
+                if a >= 0:
+                    angles.append(a)
+        
+        if not angles:
+            return 999.0
 
-        # 노이즈를 줄이기 위해 점을 일정 간격(step)으로 건너뛰며 기울기 계산
-        step = 5
-        if len(pts) < step * 2:
-            step = 1
+        angles = np.array(angles)
 
-        slopes = []
-        for i in range(0, len(pts) - step, step):
-            p_cur = pts[i]
-            p_next = pts[i + step]
+        # 각도 평균 계산 (벡터 합 이용)
+        rads = np.deg2rad(angles)
+        sin_sum = np.sum(np.sin(rads))
+        cos_sum = np.sum(np.cos(rads))
+        mean_rad = np.arctan2(sin_sum, cos_sum)
+        mean_deg = np.degrees(mean_rad)
+        if mean_deg < 0: mean_deg += 360
 
-            dx = p_next[0] - p_cur[0]
-            dy = p_next[1] - p_cur[1]
+        # 각도 차이 계산 (최단 거리: 359도와 1도의 차이는 2도)
+        diffs = np.abs(angles - mean_deg)
+        diffs = np.minimum(diffs, 360 - diffs)
 
-            # 수직선(dx=0)에 가까우면 기울기가 무한대가 되므로 큰 값 처리
-            if dx == 0:
-                angle = 90.0  # 혹은 매우 큰 기울기
-            else:
-                slope = dy / dx
-                # 기울기(dy/dx) 자체보다는 각도(arctan)를 쓰는 것이 변화량 체크에 유리함
-                angle = math.degrees(math.atan(slope))
-
-            slopes.append(angle)
-
-        if not slopes:
-            return False
-
-        # 각도의 표준편차 계산
-        # 수평선은 거의 일직선이므로 각도 변화가 적어야 함 (std 낮음)
-        # 파도나 둥근 물체는 각도가 계속 변하므로 std 높음
-        std_dev = np.std(slopes)
-
-        # 수평선은 대체로 0도 근처여야 함 (평균 각도 체크 옵션)
-        mean_angle = np.mean(slopes)
-
-        # 임계값: 표준편차가 작아야 하고(직선), 평균 각도도 너무 수직이면 안됨(수평선 가정)
-        # linearity_thresh는 생성자에서 조절 가능 (기본값 설정 필요)
-        # 여기서는 각도(degree) 기준 대략 10~20도 이상 꺾이면 제외
-        if std_dev > 10.0:
-            return False
-
-        if abs(mean_angle) > 45.0:  # 수평선이 45도 이상 기울어질 리 없다고 가정
-            return False
-
-        return True
+        # 표준편차
+        std_dev = np.sqrt(np.mean(diffs ** 2))
+        return std_dev
 
     def _extrapolate_y(self, p_start, p_end, target_x):
-        """
-        [조건 4 구현 함수]
-        두 점(p_start -> p_end)을 잇는 직선 상에서 target_x일 때의 y좌표를 구함
-        """
         x1, y1 = p_start
         x2, y2 = p_end
-
         dx = x2 - x1
         dy = y2 - y1
-
-        if dx == 0:
-            return y2  # 수직선이면 y값 그대로 반환
-
+        if dx == 0: return y2
         slope = dy / dx
-
-        # y - y2 = m(x - x2)  =>  y = m(x - x2) + y2
-        target_y = slope * (target_x - x2) + y2
-        return target_y
-
+        return slope * (target_x - x2) + y2
 
 if __name__ == "__main__":
-    # 간단한 테스트 실행
-    print("수정된 roi_using.py 모듈입니다. analysis.py에서 import하여 사용하세요.")
+    print("Updated roi_using.py with Multi-scale Custom Canny and Angle Filtering.")
