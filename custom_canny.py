@@ -24,15 +24,8 @@ class GradientCannyDetector:
         """
         if img_bgr is None or img_bgr.size == 0:
             return None, None, None
-
-        # 1. Grayscale 변환
-        if len(img_bgr.shape) == 3:
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = img_bgr
-
-        # 2. 노이즈 제거 (Gaussian Blur) - Canny의 필수 전처리
-        blurred = cv2.GaussianBlur(gray, (self.blur_ksize, self.blur_ksize), 1.4)
+               
+        blurred = img_bgr # 이미 gray scale, blurred 처리된 이미지를 받기 때문에
 
         # 3. Gradient 계산 (Sobel)
         grad_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=self.ksize)

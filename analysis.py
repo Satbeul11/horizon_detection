@@ -235,7 +235,7 @@ def main():
     out_dir = os.path.join(input_dir, "컨투어 조건 버전(수정)")
     os.makedirs(out_dir, exist_ok=True)
 
-    detector = FastHorizonDetector(num_regions=9)
+    detector = FastHorizonDetector()
 
     img_paths = []
     img_paths += glob.glob(os.path.join(input_dir, "*.jpg"))
