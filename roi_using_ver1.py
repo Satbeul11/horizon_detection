@@ -20,12 +20,12 @@ class FastHorizonDetector:
             canny_thresh1=76,
             canny_thresh2=147,
             edge_sum_thresh=148,
-            top_n_contours=5,
-            angle_std_thresh=20.0,
+            top_n_contours=3,
+            angle_std_thresh=40.6,
             target_angle=90.0,
             # [New] 가중치 파라미터 추가 (a, b)
-            score_weight_len=0.5,  # a: 길이 가중치 (0.0 ~ 1.0)
-            score_weight_std=0.5   # b: 편차(직선성) 가중치 (0.0 ~ 1.0)
+            score_weight_len=0.21,  # a: 길이 가중치 (0.0 ~ 1.0)
+            score_weight_std=0.98   # b: 편차(직선성) 가중치 (0.0 ~ 1.0)
     ):
         self.num_regions = num_regions
         self.roi_resize_factor = roi_resize_factor
