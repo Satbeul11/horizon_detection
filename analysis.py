@@ -6,8 +6,8 @@ import glob
 import cv2
 import numpy as np
 
-from roi_using import FastHorizonDetector
-
+# 수정된 roi_using.py에서 클래스 import
+from roi_using_ver1 import FastHorizonDetector
 
 def imread_unicode(path: str):
     stream = np.fromfile(path, dtype=np.uint8)
@@ -20,7 +20,6 @@ def imwrite_unicode(path: str, img) -> bool:
         return False
     buf.tofile(path)
     return True
-
 
 def compute_roi_stats_and_distances(img_bgr: np.ndarray, detector: FastHorizonDetector):
     """(이전과 동일) ROI들 mean/cov + 인접쌍 D 계산"""
@@ -95,7 +94,6 @@ def compute_roi_stats_and_distances(img_bgr: np.ndarray, detector: FastHorizonDe
         "pair_distances": pair_distances,
     }
 
-
 def overlay_edges_on_full_image(vis, roi_y0, roi_y1, edge_combined, alpha=0.55):
     """
     edge_combined: ROI 좌표계(roi_y0~roi_y1)에서의 0/255 edge map
@@ -128,7 +126,6 @@ def overlay_edges_on_full_image(vis, roi_y0, roi_y1, edge_combined, alpha=0.55):
     vis[roi_y0:roi_y1, :] = blended
     return vis
 
-
 def draw_roi_boxes_distances_stats(vis, regions_orig, pair_distances, means, covs, show_full_cov=False):
     """ROI 박스 + mean/cov(대각) + 경계별 D 텍스트"""
     h, w = vis.shape[:2]
@@ -142,6 +139,7 @@ def draw_roi_boxes_distances_stats(vis, regions_orig, pair_distances, means, cov
     thickness = 2
 
     for k, (y0, y1) in enumerate(regions_orig):
+        # ROI 박스 (기본 초록색)
         cv2.rectangle(vis, (0, y0), (w - 1, y1), (0, 255, 0), 2)
         cv2.putText(vis, f"ROI {k}", (10, max(25, y0 + 25)),
                     font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
@@ -186,23 +184,40 @@ def draw_roi_boxes_distances_stats(vis, regions_orig, pair_distances, means, cov
 
     return vis
 
-
 def draw_horizon_line(vis, horizon_result):
+    """
+    수정된 logic: horizon_result가 (a, b, full_pts_array) 형태일 경우
+    Polyline(굴곡 있는 선)으로 그립니다.
+    """
     if horizon_result is None:
         return vis
     try:
-        a, b, (x1, y1, x2, y2) = horizon_result
-        cv2.line(vis, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+        # [Modified] 반환값 Unpacking
+        # roi_using.py에서 return float(a), float(b), full_line_pts
+        a, b, pts_val = horizon_result
+        
+        # pts_val이 numpy array(점들의 집합)인지 확인
+        if isinstance(pts_val, np.ndarray):
+            # Polyline 그리기
+            # pts_val shape: (N, 2)
+            cv2.polylines(vis, [pts_val], isClosed=False, color=(0, 0, 255), thickness=3)
+        else:
+            # 혹시 구버전 튜플 (x1,y1,x2,y2)일 경우를 대비한 fallback
+            (x1, y1, x2, y2) = pts_val
+            cv2.line(vis, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+
         cv2.putText(vis, "Horizon", (10, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
-    except Exception:
+    except Exception as e:
+        # 디버깅용 print (필요시 활성화)
+        # print(f"Draw Horizon Error: {e}")
         pass
     return vis
 
-
 def main():
+    # 경로 설정 (사용자 환경에 맞게)
     input_dir = r"C:\Users\user\OneDrive - 국립한국해양대학교\바탕 화면\Projects\horizon_o\island_x\select(200)"
-    out_dir = os.path.join(input_dir, "테스트2")
+    out_dir = os.path.join(input_dir, "컨투어 조건 버전")
     os.makedirs(out_dir, exist_ok=True)
 
     detector = FastHorizonDetector(num_regions=9)
@@ -210,9 +225,11 @@ def main():
     img_paths = []
     img_paths += glob.glob(os.path.join(input_dir, "*.jpg"))
     img_paths += glob.glob(os.path.join(input_dir, "*.jpeg"))
+    # 중복 제거 및 경로 정규화
     img_paths = sorted(set(os.path.normcase(os.path.abspath(p)) for p in img_paths))
 
     input_dir_norm = os.path.normcase(os.path.abspath(input_dir))
+    # input_dir 직계 파일만 필터링
     img_paths = [p for p in img_paths if os.path.normcase(os.path.dirname(p)) == input_dir_norm]
 
     total = len(img_paths)
@@ -230,16 +247,26 @@ def main():
             continue
 
         # (B) detect()와 동일한 ROI 구간에서 edge_combined 생성
-        roi_y0, roi_y1 = detector._detect_roi_vertical_range(img)          # :contentReference[oaicite:4]{index=4}
+        roi_y0, roi_y1 = detector._detect_roi_vertical_range(img)
         roi_img = img[roi_y0:roi_y1, :]
-        edge_combined = detector._multi_scale_edge_map(roi_img)            # :contentReference[oaicite:5]{index=5}
+        
+        # [Modified] _multi_scale_edge_map 반환값이 (edges, angles)로 변경됨
+        result_map = detector._multi_scale_edge_map(roi_img)
+        if result_map is None:
+            edge_combined = None
+        else:
+            edge_combined, _ = result_map # Angle Map은 시각화에 안 쓰므로 무시
 
         # (C) 최종 수평선
-        horizon_result = detector.detect(img)                              # :contentReference[oaicite:6]{index=6}
+        horizon_result = detector.detect(img)
 
         # (D) 그리기 순서: Edge → ROI/텍스트 → Horizon
         vis = img.copy()
+        
+        # 1. Edge Overlay (분홍색 점)
         vis = overlay_edges_on_full_image(vis, roi_y0, roi_y1, edge_combined, alpha=0.55)
+        
+        # 2. ROI Box & Stats (초록색 박스, 평균/공분산 텍스트)
         vis = draw_roi_boxes_distances_stats(
             vis,
             debug["regions_orig"],
@@ -248,13 +275,14 @@ def main():
             debug["covs"],
             show_full_cov=False
         )
+        
+        # 3. Horizon Line (빨간색 굴곡선)
         vis = draw_horizon_line(vis, horizon_result)
 
         save_path = os.path.join(out_dir, os.path.splitext(img_id)[0] + "_ALL_overlay.jpg")
         imwrite_unicode(save_path, vis)
 
     print("\n[DONE] Saved to:", out_dir)
-
 
 if __name__ == "__main__":
     main()
