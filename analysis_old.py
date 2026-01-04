@@ -224,12 +224,12 @@ def draw_roi_visuals(vis, debug_info):
         
         # 픽셀 색칠하기: Cyan (Blue=255, Green=255, Red=0)
         # 점이 많을 경우 for문보다 이렇게 인덱싱으로 처리하는 것이 훨씬 빠름
-        point_color = (0, 255, 255)
+        point_color = (100, 255, 255)
 
         # for문을 돌며 원(circle)으로 그리기 -> 점이 훨씬 굵고 진하게 보임
         # radius=1 이면 지름 3픽셀 정도, radius=2 이면 지름 5픽셀 정도
         for x, y in zip(valid_xs, valid_ys):
-            cv2.circle(vis, (x, y), 2, point_color, -1)
+            cv2.circle(vis, (x, y), 1, point_color, 1)
 
     return vis
 
