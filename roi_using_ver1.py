@@ -22,7 +22,10 @@ class FastHorizonDetector:
             edge_sum_thresh=148,
             top_n_contours=5,
             angle_std_thresh=20.0,
-            target_angle=90.0
+            target_angle=90.0,
+            # [New] 가중치 파라미터 추가 (a, b)
+            score_weight_len=0.5,  # a: 길이 가중치 (0.0 ~ 1.0)
+            score_weight_std=0.5   # b: 편차(직선성) 가중치 (0.0 ~ 1.0)
     ):
         self.num_regions = num_regions
         self.roi_resize_factor = roi_resize_factor
@@ -34,6 +37,10 @@ class FastHorizonDetector:
         self.top_n_contours = top_n_contours
         self.angle_std_thresh = angle_std_thresh
         self.target_angle = target_angle
+        
+        # 가중치 저장
+        self.w_len = score_weight_len
+        self.w_std = score_weight_std
 
         if GradientCannyDetector:
             self.canny_detector = GradientCannyDetector(ksize=3, blur_ksize=5)
@@ -60,11 +67,12 @@ class FastHorizonDetector:
         if edge_combined is None:
             return None
 
-        # 3. 굴곡과 직선이 혼합된 최종 수평선 추출
+        # 3. [Modified] 점수 기반(Weighted Score) 최종 수평선 추출
         result = self._estimate_horizon_geometric(edge_combined, angle_combined, roi_y0, w, h)
         return result
 
     def _detect_roi_vertical_range(self, img_bgr):
+        # (기존 로직 유지)
         h, w = img_bgr.shape[:2]
         scale = self.roi_resize_factor
         if h < 50 or w < 50: return 0, h
@@ -118,6 +126,7 @@ class FastHorizonDetector:
         return max(0, min(y0_orig, h - 1)), max(0, min(y1_orig, h))
 
     def _multi_scale_edge_map(self, roi_img_bgr):
+        # (기존 로직 유지)
         if roi_img_bgr is None or roi_img_bgr.size == 0:
             return None, None
 
@@ -161,71 +170,88 @@ class FastHorizonDetector:
         if not contours:
             return None
 
-        # 2. 길이 기준 정렬
+        # 2. 길이 기준 정렬 (Longest First)
+        # 길이가 긴 녀석들이 우선 후보가 됩니다.
         contours = sorted(contours, key=lambda c: cv2.arcLength(c, False), reverse=True)
         candidates = contours[:self.top_n_contours]
+        
+        if not candidates:
+            return None
+
+        # [Score Calculation Setup]
+        # 점수 정규화를 위해 최대 길이(Max Length)를 구합니다.
+        # 정렬되어 있으므로 첫 번째 녀석이 가장 깁니다.
+        max_len = cv2.arcLength(candidates[0], False)
+        if max_len == 0: return None
 
         best_cnt = None
-        min_std_score = float('inf')
+        best_score = -float('inf') # 점수는 높을수록 좋음
 
+        # 3. 후보군 점수 계산 Loop
         for cnt in candidates:
-            if len(cnt) < 20: continue
+            length = cv2.arcLength(cnt, False)
+            
+            # 너무 짧은 선은 무조건 패스
+            if length < 20: continue
 
-            # 3. Angle 편차 확인
+            # Angle 편차 계산
             std_dev = self._calculate_angle_std(cnt, angle_map)
             
-            if std_dev < self.angle_std_thresh:
-                if std_dev < min_std_score:
-                    min_std_score = std_dev
-                    best_cnt = cnt
+            # --- [핵심] 점수 계산 로직 ---
+            # (A) 길이 점수 (0 ~ 1.0): 길수록 1.0에 가까움
+            norm_len = length / max_len
+            
+            # (B) 편차 점수 (1.0 ~ 음수): 편차가 0이면 1.0, 임계값이면 0.0, 그보다 크면 마이너스(벌점)
+            # 수식: 1 - (내_편차 / 허용_임계값)
+            if self.angle_std_thresh > 0:
+                norm_std = 1.0 - (std_dev / self.angle_std_thresh)
+            else:
+                norm_std = 0 # 예외처리
 
+            # 최종 스코어 = (a * 길이점수) + (b * 편차점수)
+            final_score = (self.w_len * norm_len) + (self.w_std * norm_std)
+
+            # 디버깅용 (필요시 주석 해제)
+            # print(f"Len:{length:.0f}, Std:{std_dev:.1f} -> L_sc:{norm_len:.2f}, S_sc:{norm_std:.2f} = Total:{final_score:.3f}")
+
+            # 최대 점수 갱신
+            if final_score > best_score:
+                best_score = final_score
+                best_cnt = cnt
+
+        # 만약 적절한 후보가 없다면 (점수가 너무 낮거나 없으면), 그냥 가장 긴 놈 사용 (Fallback)
         if best_cnt is None:
             if candidates and len(candidates[0]) > 50:
                 best_cnt = candidates[0]
             else:
                 return None
 
-        # --- 굴곡이 유지된 중간 + 양 끝 직선 연장 ---
-        
-        # 1) Contour 좌표 정리 (X축 기준 정렬)
+        # --- 4. 최종 수평선 좌표 계산 (10% Slope Extrapolation) ---
         pts = best_cnt.squeeze()
         if pts.ndim == 1: pts = pts.reshape(-1, 2)
         pts = pts[pts[:, 0].argsort()] 
 
-        # 2) 전역 좌표(Global Coordinates)로 변환
         pts_global = pts.astype(np.float32)
         pts_global[:, 1] += roi_y0
 
-        # [Modified] 양 끝 10% 데이터를 이용한 Trend Line 기울기 계산
+        # 양 끝 10% 데이터를 이용한 Trend Line 기울기
         num_pts = len(pts_global)
-        # 최소 2개 이상, 전체의 10% 개수 (최소 2개는 있어야 기울기 계산 가능)
         subset_len = max(2, int(num_pts * 0.10))
         
-        # --- 3) 왼쪽 확장 ---
-        # 왼쪽 10% 포인트 가져오기
+        # 왼쪽 확장
         left_segment = pts_global[:subset_len]
-        
-        # Linear Regression (np.polyfit)으로 기울기(m) 계산
-        # 1차 함수 y = mx + c
         if len(left_segment) >= 2:
             m_left, _ = np.polyfit(left_segment[:, 0], left_segment[:, 1], 1)
         else:
-            # 혹시 모를 예외 처리 (그냥 두 점 기울기)
             p0, p1 = pts_global[0], pts_global[1]
             dx = p1[0] - p0[0]
             m_left = (p1[1] - p0[1]) / dx if dx != 0 else 0
             
-        # x=0 까지 연장 (기준점은 Contour의 가장 왼쪽 점인 pts_global[0])
-        # 공식: y = m * (x_target - x_ref) + y_ref
         p_start_ref = pts_global[0]
         left_y_global = m_left * (0 - p_start_ref[0]) + p_start_ref[1]
 
-        
-        # --- 4) 오른쪽 확장 ---
-        # 오른쪽 10% 포인트 가져오기
+        # 오른쪽 확장
         right_segment = pts_global[-subset_len:]
-        
-        # 기울기(m) 계산
         if len(right_segment) >= 2:
             m_right, _ = np.polyfit(right_segment[:, 0], right_segment[:, 1], 1)
         else:
@@ -233,19 +259,16 @@ class FastHorizonDetector:
             dx = pn[0] - pn_1[0]
             m_right = (pn[1] - pn_1[1]) / dx if dx != 0 else 0
             
-        # x=Width-1 까지 연장 (기준점은 Contour의 가장 오른쪽 점인 pts_global[-1])
         p_end_ref = pts_global[-1]
         right_y_global = m_right * ((img_width - 1) - p_end_ref[0]) + p_end_ref[1]
 
-
-        # 5) 점 합치기: [Left_Point] + [Contour_Points] + [Right_Point]
+        # 합치기
         left_pt = np.array([[0, left_y_global]], dtype=np.float32)
         right_pt = np.array([[img_width - 1, right_y_global]], dtype=np.float32)
         
         full_line_pts = np.concatenate((left_pt, pts_global, right_pt), axis=0)
         full_line_pts = full_line_pts.astype(np.int32)
 
-        # 6) 반환값 구성 (기존 호환성 유지)
         dy = right_y_global - left_y_global
         dx = img_width - 1
         a = dy / dx if dx != 0 else 0
@@ -254,6 +277,7 @@ class FastHorizonDetector:
         return float(a), float(b), full_line_pts
 
     def _calculate_angle_std(self, cnt, angle_map):
+        # (기존 로직 유지)
         angles = []
         h, w = angle_map.shape
         step = 1
@@ -282,8 +306,6 @@ class FastHorizonDetector:
         return std_dev
 
     def _extrapolate_y(self, p_start, p_end, target_x):
-        # 이제 이 함수는 직접 사용되지 않고 np.polyfit 로직으로 대체되었으나, 
-        # 클래스 내 유틸리티로 남겨둠
         x1, y1 = p_start
         x2, y2 = p_end
         dx = x2 - x1
@@ -293,4 +315,4 @@ class FastHorizonDetector:
         return slope * (target_x - x2) + y2
 
 if __name__ == "__main__":
-    print("Updated roi_using.py: 10% Slope Extrapolation.")
+    print("Updated roi_using.py: Weighted Score Logic (Length vs StdDev).")
