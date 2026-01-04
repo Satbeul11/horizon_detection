@@ -8,13 +8,13 @@ import glob
 class FastHorizonDetector:
     def __init__(
         self,
-        num_regions=9,
-        roi_resize_factor=0.25,
-        scales=(1, 2, 3),
-        canny_thresh1=50,
-        canny_thresh2=150,
-        edge_sum_thresh=170,
-        hough_threshold=50
+        num_regions=4, # 9
+        roi_resize_factor=0.2023, # 0.25
+        scales=(1, 2, 3), # (1,2,3)
+        canny_thresh1=76, # 50
+        canny_thresh2=147, # 150
+        edge_sum_thresh=148, # 170
+        hough_threshold=35 # 50
     ):
         self.num_regions = num_regions
         self.roi_resize_factor = roi_resize_factor

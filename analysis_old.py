@@ -116,7 +116,7 @@ def draw_roi_boxes_distances_stats(
     means,
     covs,
     show_full_cov=False,
-    force_nine=True
+    force_nine=False
 ):
     """(기존 코드 유지) 통계 박스 그리기"""
     vis = img_bgr.copy()
@@ -251,10 +251,10 @@ def draw_horizon_line(vis, horizon_result):
 def main():
     # 경로 설정
     input_dir = r"C:\Users\user\OneDrive - 국립한국해양대학교\바탕 화면\Projects\horizon_o\island_x\select(200)"
-    out_dir = os.path.join(input_dir, "논문 그대로_roi_overlay_with_horizon_stats")
+    out_dir = os.path.join(input_dir, "논문 그대로(최적화)")
     os.makedirs(out_dir, exist_ok=True)
 
-    detector = FastHorizonDetector(num_regions=9)
+    detector = FastHorizonDetector()
 
     # 이미지 파일 리스트업
     img_paths = []
